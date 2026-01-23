@@ -6,5 +6,7 @@ torch
 torchvision
 medmnist
 matplotlib
-tqdm
 seaborn
+tqdm
+psutil
+scipy

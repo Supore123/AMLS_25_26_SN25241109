@@ -1,0 +1,8 @@
+name: AMLS_25_26_SN25241109
+
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+    - -r requirements.txt
+
