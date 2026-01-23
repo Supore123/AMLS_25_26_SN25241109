@@ -1,6 +1,5 @@
 /Datasets
 /Code/output
 
-*.pyc
-*.pyo
-
+**/__pycache__/
+*.py[cod]
