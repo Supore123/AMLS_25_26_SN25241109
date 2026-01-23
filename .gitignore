@@ -1,1 +1,6 @@
 /Datasets
+/Code/output
+
+*.pyc
+*.pyo
+
