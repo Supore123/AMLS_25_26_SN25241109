@@ -21,7 +21,7 @@ Execute the main script from the root directory:
 `python main.py`
 
 This will automatically:
-1. Download the dataset (if not present).
+1. Create the Dataset/ directory and place the .npz within that directory
 2. Train Model A (SVM) with and without HOG features.
 3. Train Model B (ResNet) with and without Data Augmentation.
 4. Output test accuracy for all experiments.
