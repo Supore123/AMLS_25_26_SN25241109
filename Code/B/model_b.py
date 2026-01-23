@@ -1,12 +1,29 @@
+"""ResNet utilities and training helpers for Model B experiments.
+
+This module defines a ResNet-based model adapted to grayscale input and
+several training utilities that return structured training history. Logging
+is used instead of print statements and all functions include type hints
+and Google-style docstrings.
+"""
+
+from typing import Any, Dict, Tuple, List
+import logging
+import os
+
+import numpy as np
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import StepLR
 from torchvision.models import resnet18
-import matplotlib.pyplot as plt
-import os
-from sklearn.metrics import classification_report, accuracy_score, confusion_matrix, ConfusionMatrixDisplay
+from sklearn.metrics import classification_report, accuracy_score, confusion_matrix
 
+logger = logging.getLogger(__name__)
+FIGURES_DIR = os.path.join("Code", "output", "figures")
+os.makedirs(FIGURES_DIR, exist_ok=True)
+
+# --- 1. The Model Class (Kept simple) ---
 class ModelB(nn.Module):
     def __init__(self):
         super(ModelB, self).__init__()
@@ -22,95 +39,256 @@ class ModelB(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-def run_hyperparameter_sweep(train_loader, val_loader, test_loader, epochs=15):
-    """
-    MSc Level: Runs the model with different Learning Rates to find the optimal configuration.
-    """
-    learning_rates = [0.01, 0.001, 0.0001]
-    results = {}
-    
-    print(f"\n--- Model B (ResNet) | Hyperparameter Sweep (LRs: {learning_rates}) ---")
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# --- 2. Training Functions (MOVED OUTSIDE THE CLASS) ---
 
-    for lr in learning_rates:
-        print(f"   -> Testing Learning Rate: {lr}")
-        model = ModelB().to(device)
-        criterion = nn.BCEWithLogitsLoss()
-        optimizer = optim.Adam(model.parameters(), lr=lr)
-        
-        # Scheduler: Drop LR by factor of 0.1 every 7 epochs (Standard practice)
-        scheduler = StepLR(optimizer, step_size=7, gamma=0.1)
-        
-        val_acc_history = []
-        
-        for epoch in range(epochs):
-            model.train()
-            for images, labels in train_loader:
+def train_resnet_with_tracking(
+    train_loader: Any,
+    val_loader: Any,
+    test_loader: Any,
+    epochs: int = 15,
+    lr: float = 0.001,
+    use_augmentation: bool = True,
+) -> Tuple[ModelB, Dict[str, list], float, np.ndarray, np.ndarray, np.ndarray]:
+    """Train ResNet and track complete training history.
+
+    Args:
+        train_loader: Training DataLoader.
+        val_loader: Validation DataLoader.
+        test_loader: Test DataLoader.
+        epochs (int): Number of epochs.
+        lr (float): Learning rate.
+        use_augmentation (bool): Informational flag; pipeline should
+            configure augmentation externally.
+
+    Returns:
+        Tuple containing: trained model, history dict, test accuracy and
+        arrays (y_true, y_pred, y_probs).
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = ModelB().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.BCEWithLogitsLoss()
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
+
+    history: Dict[str, list] = {
+        "train_loss": [],
+        "val_loss": [],
+        "train_acc": [],
+        "val_acc": [],
+        "learning_rates": [],
+    }
+
+    logger.info("Training ResNet (lr=%s, augment=%s)", lr, use_augmentation)
+
+    for epoch in range(epochs):
+        # Training phase
+        model.train()
+        train_loss = 0.0
+        train_correct = 0
+        train_total = 0
+
+        for images, labels in train_loader:
+            images, labels = images.to(device), labels.float().to(device)
+
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            train_loss += loss.item()
+            predicted = (torch.sigmoid(outputs) > 0.5).float()
+            train_total += labels.size(0)
+            train_correct += (predicted == labels).sum().item()
+
+        # Validation phase
+        model.eval()
+        val_loss = 0.0
+        val_correct = 0
+        val_total = 0
+
+        with torch.no_grad():
+            for images, labels in val_loader:
                 images, labels = images.to(device), labels.float().to(device)
-                optimizer.zero_grad()
                 outputs = model(images)
                 loss = criterion(outputs, labels)
-                loss.backward()
-                optimizer.step()
-            
-            scheduler.step()
-            
-            # Validation
-            model.eval()
-            correct = 0; total = 0
-            with torch.no_grad():
-                for images, labels in val_loader:
-                    images, labels = images.to(device), labels.float().to(device)
-                    outputs = model(images)
-                    predicted = (torch.sigmoid(outputs) > 0.5).float()
-                    total += labels.size(0)
-                    correct += (predicted == labels).sum().item()
-            val_acc_history.append(correct / total)
-        
-        results[lr] = {
-            'model': model,
-            'val_history': val_acc_history,
-            'final_val_acc': val_acc_history[-1]
-        }
-        print(f"      Final Val Acc: {val_acc_history[-1]:.4f}")
 
-    # Select Best Model
-    best_lr = max(results, key=lambda x: results[x]['final_val_acc'])
-    print(f"\n   -> BEST Learning Rate found: {best_lr}")
-    best_model = results[best_lr]['model']
-    
-    # PLOT SWEEP RESULTS (Evidence for Report)
-    plt.figure(figsize=(8, 5))
-    for lr, data in results.items():
-        plt.plot(data['val_history'], label=f'LR={lr}')
-    plt.title("Hyperparameter Search: Learning Rate Impact")
-    plt.xlabel("Epoch")
-    plt.ylabel("Validation Accuracy")
-    plt.legend()
-    plt.savefig("resnet_lr_sweep.png")
-    plt.close()
+                val_loss += loss.item()
+                predicted = (torch.sigmoid(outputs) > 0.5).float()
+                val_total += labels.size(0)
+                val_correct += (predicted == labels).sum().item()
 
-    # FINAL TEST EVALUATION ON BEST MODEL
-    best_model.eval()
-    y_true, y_pred = [], []
+        # Record metrics
+        history['train_loss'].append(train_loss / len(train_loader))
+        history['val_loss'].append(val_loss / len(val_loader))
+        history['train_acc'].append(train_correct / train_total)
+        history['val_acc'].append(val_correct / val_total)
+        history['learning_rates'].append(optimizer.param_groups[0]['lr'])
+
+        scheduler.step()
+
+        if (epoch + 1) % 3 == 0:
+            logger.info(
+                "Epoch %d/%d: Train Loss=%.4f, Val Acc=%.4f",
+                epoch + 1,
+                epochs,
+                history["train_loss"][-1],
+                history["val_acc"][-1],
+            )
+
+    # Final test evaluation
+    model.eval()
+    test_correct = 0
+    test_total = 0
+    y_true_list = []
+    y_pred_list = []
+    y_probs_list = []
+
     with torch.no_grad():
         for images, labels in test_loader:
             images, labels = images.to(device), labels.float().to(device)
-            outputs = best_model(images)
-            predicted = (torch.sigmoid(outputs) > 0.5).float()
-            y_true.extend(labels.cpu().numpy())
-            y_pred.extend(predicted.cpu().numpy())
+            outputs = model(images)
+            probs = torch.sigmoid(outputs)
+            predicted = (probs > 0.5).float()
 
-    # Full Report
-    print("\n--- Final Model B Evaluation ---")
-    print(classification_report(y_true, y_pred, target_names=['Benign', 'Malignant'], digits=4))
-    
-    # Confusion Matrix
-    cm = confusion_matrix(y_true, y_pred)
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['Benign', 'Malignant'])
-    plt.figure(figsize=(5,5))
-    disp.plot(cmap='Blues', values_format='d')
-    plt.title(f"ResNet Confusion Matrix (LR={best_lr})")
-    plt.savefig("resnet_confusion.png")
-    
-    return accuracy_score(y_true, y_pred)
+            test_total += labels.size(0)
+            test_correct += (predicted == labels).sum().item()
+
+            y_true_list.extend(labels.cpu().numpy())
+            y_pred_list.extend(predicted.cpu().numpy())
+            y_probs_list.extend(probs.cpu().numpy())
+
+    test_acc = test_correct / test_total if test_total > 0 else 0.0
+    logger.info("Final Test Accuracy: %.4f", test_acc)
+
+    return model, history, test_acc, np.array(y_true_list), np.array(y_pred_list), np.array(y_probs_list)
+
+
+def plot_training_history(history: Dict[str, list], title: str = "ResNet Training") -> None:
+    """Plot training dynamics and save figures for the training history.
+
+    Args:
+        history (Dict[str, list]): Training history containing loss, acc and
+            learning rate entries.
+        title (str): Title used for the saved filename and figure.
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    epochs = range(1, len(history['train_loss']) + 1)
+
+    # Loss plot
+    axes[0, 0].plot(epochs, history['train_loss'], 'b-', label='Training Loss', linewidth=2)
+    axes[0, 0].plot(epochs, history['val_loss'], 'r-', label='Validation Loss', linewidth=2)
+    axes[0, 0].set_xlabel('Epoch', fontsize=11)
+    axes[0, 0].set_ylabel('Loss', fontsize=11)
+    axes[0, 0].set_title('Loss vs Epoch', fontsize=12)
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+
+    # Accuracy plot
+    axes[0, 1].plot(epochs, history['train_acc'], 'b-', label='Training Accuracy', linewidth=2)
+    axes[0, 1].plot(epochs, history['val_acc'], 'r-', label='Validation Accuracy', linewidth=2)
+    axes[0, 1].set_xlabel('Epoch', fontsize=11)
+    axes[0, 1].set_ylabel('Accuracy', fontsize=11)
+    axes[0, 1].set_title('Accuracy vs Epoch', fontsize=12)
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+
+    # Learning rate schedule
+    axes[1, 0].plot(epochs, history['learning_rates'], 'g-', linewidth=2)
+    axes[1, 0].set_xlabel('Epoch', fontsize=11)
+    axes[1, 0].set_ylabel('Learning Rate', fontsize=11)
+    axes[1, 0].set_title('Learning Rate Schedule', fontsize=12)
+    axes[1, 0].set_yscale('log')
+    axes[1, 0].grid(True, alpha=0.3)
+
+    # Overfitting analysis
+    train_val_gap = np.array(history['train_acc']) - np.array(history['val_acc'])
+    axes[1, 1].plot(epochs, train_val_gap, 'm-', linewidth=2)
+    axes[1, 1].axhline(y=0, color='k', linestyle='--', alpha=0.3)
+    axes[1, 1].fill_between(epochs, 0, train_val_gap, alpha=0.3)
+    axes[1, 1].set_xlabel('Epoch', fontsize=11)
+    axes[1, 1].set_ylabel('Train - Val Accuracy', fontsize=11)
+    axes[1, 1].set_title('Overfitting Gap Analysis', fontsize=12)
+    axes[1, 1].grid(True, alpha=0.3)
+
+    plt.suptitle(title, fontsize=14, y=0.995)
+    plt.tight_layout()
+    out_path = os.path.join(FIGURES_DIR, f"{title.replace(' ', '_')}_history.png")
+    plt.savefig(out_path, dpi=300)
+    plt.close()
+    logger.info("Saved training history plot for %s to %s", title, out_path)
+
+
+def train_resnet_with_history(train_loader: Any, val_loader: Any, epochs: int = 15, lr: float = 0.001) -> Tuple[ModelB, Dict[str, list]]:
+    """Train ResNet and return full training history for plotting.
+
+    Args:
+        train_loader: Training DataLoader.
+        val_loader: Validation DataLoader.
+        epochs (int): Number of epochs to train.
+        lr (float): Learning rate.
+
+    Returns:
+        Tuple[ModelB, Dict[str, list]]: Trained model and history dict.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = ModelB().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.BCEWithLogitsLoss()
+
+    history: Dict[str, list] = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
+
+    for epoch in range(epochs):
+        # Training
+        model.train()
+        train_loss = 0
+        train_correct = 0
+        train_total = 0
+
+        for images, labels in train_loader:
+            images, labels = images.to(device), labels.float().to(device)
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            train_loss += loss.item()
+            predicted = (torch.sigmoid(outputs) > 0.5).float()
+            train_total += labels.size(0)
+            train_correct += (predicted == labels).sum().item()
+
+        # Validation
+        model.eval()
+        val_loss = 0
+        val_correct = 0
+        val_total = 0
+
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images, labels = images.to(device), labels.float().to(device)
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+
+                val_loss += loss.item()
+                predicted = (torch.sigmoid(outputs) > 0.5).float()
+                val_total += labels.size(0)
+                val_correct += (predicted == labels).sum().item()
+
+        # Record history
+        history["train_loss"].append(train_loss / len(train_loader))
+        history["val_loss"].append(val_loss / len(val_loader))
+        history["train_acc"].append(train_correct / train_total)
+        history["val_acc"].append(val_correct / val_total)
+
+        logger.info(
+            "Epoch %d/%d: Train Loss: %.4f, Val Loss: %.4f, Val Acc: %.4f",
+            epoch + 1,
+            epochs,
+            history["train_loss"][-1],
+            history["val_loss"][-1],
+            history["val_acc"][-1],
+        )
+
+    return model, history
